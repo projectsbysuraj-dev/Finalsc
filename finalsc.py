@@ -293,6 +293,11 @@ def record_channel_joined(user_id: str, channel_id: str):
     db_request(f"channel_joins/{user_id}/{clean_ch}.json", method="PUT", data=True)
 
 
+def remove_channel_joined(user_id: str, channel_id: str):
+    clean_ch = re.sub(r"[^a-zA-Z0-9_-]", "_", str(channel_id))
+    db_request(f"channel_joins/{user_id}/{clean_ch}.json", method="DELETE")
+
+
 def is_channel_joined_in_db(user_id: str, channel_id: str) -> bool:
     clean_ch = re.sub(r"[^a-zA-Z0-9_-]", "_", str(channel_id))
     res = db_request(f"channel_joins/{user_id}/{clean_ch}.json")
@@ -510,11 +515,9 @@ def check_user_channels(user_id: int) -> tuple[bool, list[dict]]:
     unjoined = []
     for ch in channels:
         ch_id = str(ch.get("id", "")).strip()
-
-        if is_channel_joined_in_db(str(user_id), ch_id):
-            continue
-
         target = int(ch_id) if ch_id.lstrip("-").isdigit() else ch_id
+
+        # 1. Always check live Telegram membership status first (detects if user left or was kicked!)
         res = tg_api("getChatMember", {"chat_id": target, "user_id": user_id})
 
         if res.get("ok") and res.get("result"):
@@ -523,9 +526,17 @@ def check_user_channels(user_id: int) -> tuple[bool, list[dict]]:
                 record_channel_joined(str(user_id), ch_id)
                 continue
             elif status in ["left", "kicked"]:
+                # If user sent a join request to a private channel (not auto-approved yet),
+                # Telegram status is still "left", so allow if join request was recorded in DB.
+                # However, if user had joined and later left, chat_member update removes it from DB!
+                if is_channel_joined_in_db(str(user_id), ch_id):
+                    continue
                 unjoined.append(ch)
                 continue
         else:
+            # If user is not a member yet, check if they sent a join request recorded in DB
+            if is_channel_joined_in_db(str(user_id), ch_id):
+                continue
             desc = str(res.get("description", "")).lower()
             if "not a member" in desc or "user not found" in desc:
                 unjoined.append(ch)
@@ -647,7 +658,11 @@ def handle_start(chat_id, user: dict, args: list[str]):
         )
         return
 
-    if existing.get("isVerified") and existing.get("deviceVerified") and not existing.get("deviceBlocked"):
+    # Always verify that user is still joined / has sent join request to all mandatory channels!
+    # If user left any channel and presses /start again, force them to rejoin before showing Home page.
+    all_joined, _ = check_user_channels(int(user_id))
+
+    if all_joined and existing.get("isVerified") and existing.get("deviceVerified") and not existing.get("deviceBlocked"):
         app_url = f"{WEB_URL}/?uid={user_id}&start=ref_{referrer_id}" if referrer_id else f"{WEB_URL}/?uid={user_id}"
         verified_markup = {
             "inline_keyboard": [
@@ -690,10 +705,36 @@ def handle_claim_callback(query: dict):
 
     all_joined, _ = check_user_channels(int(user_id))
     if not all_joined:
-        answer_callback_query(query_id, "⚠️ Kripya sabhi channels join karein fir Claim dabayein!", show_alert=True)
+        answer_callback_query(query_id, "⚠️ Kripya sabhi channels join karein (ya Join Request bhejein) fir Claim dabayein!", show_alert=True)
         return
 
     answer_callback_query(query_id)
+
+    # Check if user already completed Step 2 Device Verification previously (e.g. rejoined after leaving channel)
+    db_user = get_user_from_db(user_id) or {}
+    if db_user.get("deviceBlocked") is True:
+        answer_callback_query(
+            query_id,
+            "🚫 Device Verification Failed! Ye account permanently block ho chuka hai.",
+            show_alert=True,
+        )
+        return
+
+    if db_user.get("deviceVerified") and db_user.get("isVerified"):
+        app_url = f"{WEB_URL}/?uid={user_id}&start={ref_param}" if ref_param else f"{WEB_URL}/?uid={user_id}"
+        final_markup = {
+            "inline_keyboard": [
+                [pbtn("🎉 Click To Home", emoji_char="🎉", web_app={"url": app_url})],
+                [pbtn("👥 Refer And Earn", emoji_char="👥", callback_data="my_invite")],
+            ]
+        }
+        final_text = (
+            f"{pe('🔥')}<b>Congratulations Sussefuly Verfied {pe('✅')}</b>\n\n"
+            f"{pe('🎉')} <b>Click To Home And Refer And Earn {pe('🎉')}</b>\n\n"
+            f"{pe('😍')}{pe('😍')}<b>Now All Payment Instant {pe('😍')}{pe('😍')}</b>"
+        )
+        edit_message_text_smart(chat_id, message_id, final_text, reply_markup=final_markup)
+        return
 
     verify_url = f"{WEB_URL}/?verify=true&uid={user_id}"
     if ref_param:
@@ -727,6 +768,24 @@ def handle_check_device_callback(query: dict):
         raw = data.replace("check_device_", "")
         if raw != "none":
             ref_param = raw
+
+    # Also ensure user hasn't left any channel before unlocking Home
+    all_joined, _ = check_user_channels(int(user_id))
+    if not all_joined:
+        answer_callback_query(
+            query_id,
+            "⚠️ Aapne channel leave kar diya hai! Kripya sabhi channels wapas join karein.",
+            show_alert=True,
+        )
+        channels = load_channels()
+        welcome_text = (
+            f"{pe('🎁')} <b>Hey  Welcome To Scratch The Win !!</b>\n\n"
+            f"{pe('🛫')} <b>Join  Channels Below To Continue{pe('🛫')}</b>\n\n"
+            f"{pe('😍')} <b>After Joining Click Claim{pe('🚨')}</b>"
+        )
+        markup = build_channels_keyboard(channels, ref_param)
+        edit_message_text_smart(chat_id, message_id, welcome_text, reply_markup=markup)
+        return
 
     db_user = get_user_from_db(user_id) or {}
     if db_user.get("deviceBlocked") is True:
@@ -1115,14 +1174,27 @@ def handle_broadcast(chat_id, user: dict, message: dict):
 # ---------------------------------------------------------------------------
 def process_update(upd: dict):
     try:
-        # 1. Handle Chat Join Request (Private Channels)
+        # 1. Handle Chat Join Request (Private Channels - Record request only, NO Auto-Approve)
         if "chat_join_request" in upd:
             req = upd["chat_join_request"]
             user_id = str(req.get("from", {}).get("id", ""))
             chat_id = str(req.get("chat", {}).get("id", ""))
             if user_id and chat_id:
                 record_channel_joined(user_id, chat_id)
-                tg_api("approveChatJoinRequest", {"chat_id": chat_id, "user_id": int(user_id)})
+            return
+
+        # 1b. Handle Chat Member Status Change (Detect when user leaves/is kicked or joins a channel)
+        if "chat_member" in upd:
+            cm = upd["chat_member"]
+            chat_id = str(cm.get("chat", {}).get("id", ""))
+            new_m = cm.get("new_chat_member") or {}
+            user_id = str((new_m.get("user") or {}).get("id", ""))
+            status = new_m.get("status", "")
+            if user_id and chat_id:
+                if status in ["left", "kicked"]:
+                    remove_channel_joined(user_id, chat_id)
+                elif status in ["member", "administrator", "creator", "restricted"]:
+                    record_channel_joined(user_id, chat_id)
             return
 
         # 2. Handle Callback Query (Inline Buttons)
@@ -1207,7 +1279,7 @@ def main():
                 {
                     "offset": offset,
                     "timeout": 25,
-                    "allowed_updates": ["message", "callback_query", "chat_join_request"],
+                    "allowed_updates": ["message", "callback_query", "chat_join_request", "chat_member"],
                 },
                 timeout=35,
             )
