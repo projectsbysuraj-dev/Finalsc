@@ -32,7 +32,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 # ---------------------------------------------------------------------------
 # 1. CORE BOT CONFIGURATION
 # ---------------------------------------------------------------------------
-TOKEN = os.environ.get("BOT_TOKEN", "8611638952:AAFGZ3rPKDEb7j0kKIL36T5vm8UDzCzlN5Y").strip()
+TOKEN = os.environ.get("BOT_TOKEN", "8611638952:AAFrPKDEb7j0kKIL36T5vm8UDzCzlN5Y").strip()
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "scratch_the_upi_bot").strip().lstrip("@")
 WEB_URL = os.environ.get("WEB_URL", "https://scratchthewin.vercel.app/").strip().rstrip("/")
 RTDB_URL = os.environ.get("RTDB_URL", "https://scratch-7d728-default-rtdb.firebaseio.com").strip().rstrip("/")
